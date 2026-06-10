@@ -1,0 +1,309 @@
+#!/usr/bin/env bash
+#
+# start-hy2 — on-demand Hysteria 2 proxy server with automatic UPnP port mapping.
+#
+#   ./start-hy2            start the server (run this inside `screen`)
+#   ./start-hy2 start      same as above
+#   ./start-hy2 stop       stop the server and remove the UPnP port mapping
+#   ./start-hy2 status     show whether it's running + the current connection link
+#   ./start-hy2 link       re-print the hysteria2:// link and QR code
+#
+# Self-contained: the binary, helpers (upnpc/qrencode) and every file generated
+# at runtime live in this script's own folder. Designed to live in a `screen`
+# session: starting runs the server in the foreground, and pressing Ctrl-C (or
+# `./start-hy2 stop` from another shell) tears everything down — the UPnP mapping
+# is removed and all session files (cert/key/config/credentials) are wiped.
+
+set -uo pipefail
+
+# ---------------------------------------------------------------------------
+# Paths / constants — everything is relative to this script's folder.
+# ---------------------------------------------------------------------------
+HYDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BIN="$HYDIR/bin/hysteria"
+UPNPC="$HYDIR/local/usr/bin/upnpc"
+QRENCODE="$HYDIR/local/usr/bin/qrencode"
+# Library dir is arch-specific (x86_64-linux-gnu / aarch64-linux-gnu); detect it.
+LIBDIR="$(dirname "$(find "$HYDIR/local/usr/lib" -name 'libminiupnpc.so*' 2>/dev/null | head -1)" 2>/dev/null)"
+[ -d "$LIBDIR" ] || LIBDIR="$HYDIR/local/usr/lib"
+CERT="$HYDIR/cert.pem"
+KEY="$HYDIR/key.pem"
+CONF="$HYDIR/config.yaml"
+STATE="$HYDIR/state.env"
+LOG="$HYDIR/hysteria.log"
+
+SNI="www.bing.com"            # SNI / masquerade host presented to the network
+MASQ_URL="https://www.bing.com/"
+DEFAULT_NODE_NAME="hy2-upnp"  # node remark used if you just press Enter at the prompt
+UPNP_LEASE=86400              # seconds; refreshed periodically while running
+
+# The node remark (label shown in the client) is resolved at start time, in order:
+#   1. the NODE_NAME environment variable, if set;
+#   2. a "node_name" file next to this script (first line) — handy for a fixed name;
+#   3. an interactive prompt (default: $DEFAULT_NODE_NAME if you press Enter).
+
+# Wrapper so upnpc finds its bundled shared library.
+upnp() { LD_LIBRARY_PATH="$LIBDIR" "$UPNPC" "$@"; }
+qr()   { LD_LIBRARY_PATH="$LIBDIR" "$QRENCODE" "$@"; }
+
+# Percent-encode a string byte-by-byte (for the link's #remark — emoji/spaces).
+urlencode() {
+  local LC_ALL=C s="$1" o="" i c h
+  for (( i=0; i<${#s}; i++ )); do
+    c="${s:$i:1}"
+    case "$c" in
+      [a-zA-Z0-9.~_-]) o+="$c" ;;
+      *) printf -v h '%%%02X' "'$c"; o+="$h" ;;
+    esac
+  done
+  printf '%s' "$o"
+}
+
+c_grn=$'\e[32m'; c_cyn=$'\e[36m'; c_yel=$'\e[33m'; c_red=$'\e[31m'; c_bld=$'\e[1m'; c_rst=$'\e[0m'
+
+die() { echo "${c_red}error:${c_rst} $*" >&2; exit 1; }
+
+# Resolve the node remark into NODE_NAME (env > node_name file > prompt > default).
+resolve_node_name() {
+  if [ -n "${NODE_NAME:-}" ]; then return; fi
+  if [ -f "$HYDIR/node_name" ]; then
+    NODE_NAME="$(head -n1 "$HYDIR/node_name")"
+    [ -n "$NODE_NAME" ] || NODE_NAME="$DEFAULT_NODE_NAME"
+    return
+  fi
+  local ans=""
+  if [ -t 0 ]; then
+    read -rp "$(printf '%s' "${c_cyn}Proxy node remark / 节点备注名${c_rst} [${DEFAULT_NODE_NAME}]: ")" ans
+  fi
+  NODE_NAME="${ans:-$DEFAULT_NODE_NAME}"
+}
+
+lan_ip() {
+  ip route get 1.1.1.1 2>/dev/null \
+    | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}'
+}
+
+ext_ip() {
+  # Public IP as seen by the router's UPnP IGD (the address clients dial).
+  upnp -s 2>/dev/null | awk -F' = ' '/ExternalIPAddress/{print $2; exit}'
+}
+
+# ---------------------------------------------------------------------------
+# Pretty-print the connection details + QR for the current/last session.
+# ---------------------------------------------------------------------------
+show_link() {
+  # shellcheck disable=SC1090
+  source "$STATE"   # provides PORT/EXTIP/PASS/... and the stored NODE_NAME
+  local remark="${NODE_NAME:-$DEFAULT_NODE_NAME}"
+  local link="hysteria2://${PASS}@${EXTIP}:${PORT}/?insecure=1&sni=${SNI}#$(urlencode "$remark")"
+  echo
+  echo "${c_bld}========================  HYSTERIA 2  ========================${c_rst}"
+  echo "  ${c_yel}Add to your Hysteria 2 client (paste this link, or scan the QR):${c_rst}"
+  echo
+  echo "  ${c_grn}${link}${c_rst}"
+  echo
+  if [ -x "$QRENCODE" ]; then
+    qr -m 2 -t ANSIUTF8 "$link"
+  fi
+  echo "${c_bld}==============================================================${c_rst}"
+  echo
+}
+
+# ---------------------------------------------------------------------------
+# Cleanup: remove UPnP mapping + stop background helpers. Idempotent.
+# ---------------------------------------------------------------------------
+cleanup() {
+  trap - INT TERM EXIT
+  [ -f "$STATE" ] || exit 0
+  # shellcheck disable=SC1090
+  source "$STATE"
+  echo
+  echo "${c_yel}Shutting down...${c_rst}"
+  # Stop the UPnP keep-alive refresher.
+  [ -n "${KPID:-}" ] && kill "$KPID" 2>/dev/null
+  # Stop the hysteria server.
+  [ -n "${HPID:-}" ] && kill "$HPID" 2>/dev/null
+  # Remove the port mapping from the router. Success = the mapping is gone,
+  # regardless of the delete call's exit code (it returns non-zero when the
+  # mapping is already absent — e.g. our own foreground exit-trap won the race).
+  if [ -n "${PORT:-}" ]; then
+    echo "Removing UPnP mapping for UDP ${PORT}..."
+    local removed=0 i
+    for i in 1 2 3 4 5; do
+      upnp -d "$PORT" UDP >/dev/null 2>&1
+      if ! upnp -l 2>/dev/null | grep -q "${PORT}->${LANIP:-}"; then removed=1; break; fi
+      sleep 1
+    done
+    if [ "$removed" = 1 ]; then
+      echo "${c_grn}UPnP mapping removed.${c_rst}"
+    else
+      echo "${c_red}Could not remove UPnP mapping after retries (it will auto-expire).${c_rst}"
+    fi
+  fi
+  # Wipe all per-session artifacts so nothing can be reused.
+  rm -f "$STATE" "$CONF" "$CERT" "$KEY" "$LOG"
+  echo "${c_grn}Stopped — config, cert, key and credentials wiped.${c_rst}"
+  exit 0
+}
+
+# ---------------------------------------------------------------------------
+# Background loop: keep the UPnP mapping alive for the whole session.
+# ---------------------------------------------------------------------------
+keepalive() {
+  local lanip="$1" port="$2"
+  while :; do
+    sleep 3000   # ~50 min
+    upnp -a "$lanip" "$port" "$port" UDP "$UPNP_LEASE" >/dev/null 2>&1
+  done
+}
+
+gen_cert() {
+  # A brand-new self-signed cert every start; wiped again on stop.
+  echo "Generating fresh self-signed TLS certificate..."
+  rm -f "$CERT" "$KEY"
+  openssl req -x509 -nodes -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+    -keyout "$KEY" -out "$CERT" -days 3650 -subj "/CN=${SNI}" >/dev/null 2>&1 \
+    || die "openssl certificate generation failed"
+}
+
+is_running() {
+  [ -f "$STATE" ] || return 1
+  # shellcheck disable=SC1090
+  source "$STATE"
+  [ -n "${HPID:-}" ] && kill -0 "$HPID" 2>/dev/null
+}
+
+# ---------------------------------------------------------------------------
+# start
+# ---------------------------------------------------------------------------
+start() {
+  [ -x "$BIN" ]   || die "hysteria binary missing — run ./install.sh first"
+  [ -x "$UPNPC" ] || die "upnpc binary missing — run ./install.sh first"
+  if is_running; then
+    echo "${c_yel}Already running.${c_rst}"
+    show_link
+    exit 0
+  fi
+  rm -f "$STATE"
+
+  resolve_node_name        # sets NODE_NAME (prompt / file / env / default)
+  gen_cert
+
+  local lanip port pass extip
+  lanip="$(lan_ip)"
+  [ -n "$lanip" ] || die "could not determine LAN IP"
+
+  # Random UDP port in [30000, 65535].
+  port=$(( 30000 + (RANDOM % 35536) ))
+  pass="$(openssl rand -hex 16)"
+
+  echo "Opening UPnP mapping: ${lanip}:${port}  ->  WAN UDP ${port} ..."
+  local opened=0 i
+  for i in 1 2 3 4 5; do
+    upnp -a "$lanip" "$port" "$port" UDP "$UPNP_LEASE" >/dev/null 2>&1
+    if upnp -l 2>/dev/null | grep -q "${port}->${lanip}"; then opened=1; break; fi
+    sleep 1
+  done
+  [ "$opened" = 1 ] || die "UPnP port mapping failed after retries — router may not support it right now"
+
+  extip="$(ext_ip)"
+  [ -n "$extip" ] || extip="$lanip"
+
+  # Server config.
+  cat > "$CONF" <<YAML
+listen: :${port}
+
+tls:
+  cert: ${CERT}
+  key: ${KEY}
+
+auth:
+  type: password
+  password: ${pass}
+
+masquerade:
+  type: proxy
+  proxy:
+    url: ${MASQ_URL}
+    rewriteHost: true
+YAML
+
+  # Launch the server.
+  : > "$LOG"
+  "$BIN" server -c "$CONF" >> "$LOG" 2>&1 &
+  local hpid=$!
+
+  # Give it a moment and confirm it actually came up.
+  sleep 1
+  if ! kill -0 "$hpid" 2>/dev/null; then
+    echo "${c_red}Hysteria failed to start. Last log lines:${c_rst}"
+    tail -n 15 "$LOG" >&2
+    upnp -d "$port" UDP >/dev/null 2>&1
+    die "server did not start"
+  fi
+
+  # Keep the UPnP mapping fresh for long sessions.
+  keepalive "$lanip" "$port" &
+  local kpid=$!
+
+  # Persist state for `stop` / `status` / `link` and for cleanup. NODE_NAME is
+  # single-quoted (it may contain spaces/emoji) so `source` reads it back intact.
+  cat > "$STATE" <<EOF
+PORT=${port}
+LANIP=${lanip}
+EXTIP=${extip}
+PASS=${pass}
+HPID=${hpid}
+KPID=${kpid}
+EOF
+  printf "NODE_NAME='%s'\n" "${NODE_NAME//\'/\'\\\'\'}" >> "$STATE"
+
+  trap cleanup INT TERM EXIT
+  show_link
+  echo "${c_grn}Server is running.${c_rst} Detach screen with ${c_bld}Ctrl-A then D${c_rst}."
+  echo "Stop with ${c_bld}Ctrl-C${c_rst} here, or ${c_bld}./start-hy2 stop${c_rst} from another shell."
+  echo
+
+  # Block in the foreground; cleanup() runs on exit/Ctrl-C.
+  wait "$hpid"
+}
+
+# ---------------------------------------------------------------------------
+# stop (from another shell)
+# ---------------------------------------------------------------------------
+stop() {
+  if [ ! -f "$STATE" ]; then
+    echo "${c_yel}Not running (no state file).${c_rst}"
+    exit 0
+  fi
+  # cleanup() reads STATE, kills the server (which makes the foreground
+  # instance's own trap fire harmlessly) and removes the UPnP mapping.
+  cleanup
+}
+
+# ---------------------------------------------------------------------------
+# status / link
+# ---------------------------------------------------------------------------
+status() {
+  if is_running; then
+    echo "${c_grn}● running${c_rst}"
+    show_link
+  else
+    echo "${c_red}● not running${c_rst}"
+    [ -f "$STATE" ] && { echo "(stale state file present; run ./start-hy2 stop to clean up)"; }
+  fi
+}
+
+link() {
+  [ -f "$STATE" ] || die "not running — start it first with ./start-hy2"
+  show_link
+}
+
+case "${1:-start}" in
+  start|"") start ;;
+  stop)     stop ;;
+  status)   status ;;
+  link)     link ;;
+  restart)  stop; sleep 1; start ;;
+  *) echo "usage: ./start-hy2 [start|stop|status|link|restart]"; exit 1 ;;
+esac

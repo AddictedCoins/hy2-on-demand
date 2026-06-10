@@ -1,0 +1,16 @@
+# Downloaded binaries (fetched by install.sh — not committed)
+/bin/
+/local/
+/pkg/
+
+# Local node-remark override (keeps a fixed name instead of prompting)
+/node_name
+
+# Runtime-generated, per-session files (wiped on stop anyway)
+/cert.pem
+/key.pem
+/config.yaml
+/state.env
+/hysteria.log
+*.pem
+*.log
